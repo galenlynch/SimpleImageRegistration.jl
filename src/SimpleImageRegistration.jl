@@ -163,6 +163,7 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
         pad_f_sz = (div(pad_sz[1], 2) + 1, pad_sz[2])
         padded_frames_f_d = CuArray{Complex{Float32}, 3}(undef, pad_f_sz...,
                                                          batch_l)
+        synchronize()
 
         new{typeof(cdims)}(frames_h, offsets_h, 0, frames_d, padded_frames_d,
                            npad, use_phase_correlation, convd_d, cdims,
