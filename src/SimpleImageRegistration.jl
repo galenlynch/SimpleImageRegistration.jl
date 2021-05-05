@@ -73,7 +73,6 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
     frames_d::CuArray{Float32, 4}
     padded_frames_d::CuArray{Float32, 3}
     npad::Int
-    use_phase_correlation::Bool
 
     convd_d::CuArray{Float32, 4}
 
@@ -107,8 +106,7 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
                                  conv_kern::AbstractMatrix{Float32},
                                  img_kern::AbstractMatrix{Float32},
                                  scratch_dir::AbstractString = "";
-                                 npad = 20,
-                                 use_phase_correlation = false)
+                                 npad = 20)
         csz = size(conv_kern)
         csz[1] == csz[2] || throw(ArgumentError("square conv only"))
         ckern_l = csz[1]
@@ -166,11 +164,11 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
         synchronize()
 
         new{typeof(cdims)}(frames_h, offsets_h, 0, frames_d, padded_frames_d,
-                           npad, use_phase_correlation, convd_d, cdims,
-                           conv_kern_d, img_kern_d, forward_plan, rev_plan,
-                           forward_padded_plan, rev_padded_plan, convd_f_d,
-                           corr_f_d, template_f_d, template_f_d_scratch, -1,
-                           padded_frames_f_d, offsets_d)
+                           npad, convd_d, cdims, conv_kern_d, img_kern_d,
+                           forward_plan, rev_plan, forward_padded_plan,
+                           rev_padded_plan, convd_f_d, corr_f_d, template_f_d,
+                           template_f_d_scratch, -1, padded_frames_f_d,
+                           offsets_d)
     end
 end
 
@@ -251,11 +249,9 @@ function process_batch!(s::AlignmentBatchState)
             update_stream(s.forward_plan)
             cufftExecR2C(s.forward_plan, convd_packed_d, s.convd_f_d)
 
-            # Correlate frames with template
+            # Correlate frames with template in frequency domain
             s.corr_f_d .= CUDA.conj.(s.template_f_d) .* s.convd_f_d
-            if s.use_phase_correlation
-                s.corr_f_d ./= CUDA.abs.(s.corr_f_d)
-            end
+            # Inverse Fourier transform of correlation
             update_stream(s.rev_plan)
             cufftExecC2R(s.rev_plan, s.corr_f_d, convd_packed_d)
 
