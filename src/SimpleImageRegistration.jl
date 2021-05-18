@@ -96,12 +96,9 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
     offsets_d::CuMatrix{Float32}
 
     # This holds all of the arrays and plans on host and GPU to do alignment
-    # If `scratch_dir` is empty, then the host buffers will be pinned to RAM,
-    # otherwise, they will be memory-mapped files. `npad` controls how many
-    # zero pixels images will be imbedded in before they are aligned.
-    # `use_phase_correlation` controls whether alignment is done through
-    # correlation or phase-correlation. I've only tested correlation so
-    # caveat emptor.
+    # If `scratch_dir` is empty, then the host buffers will be pinned to RAM.
+    # Otherwise, they will be memory-mapped files. `npad` controls how many zero
+    # pixels will be added to images before they are aligned.
     function AlignmentBatchState(nx::Integer, ny::Integer, batch_l::Integer,
                                  conv_kern::AbstractMatrix{Float32},
                                  img_kern::AbstractMatrix{Float32},
