@@ -7,6 +7,7 @@ using CUDA: CuArray, CuVector, CuMatrix, @cuda, blockIdx, blockDim, threadIdx,
     synchronize
 using CUDA.CUFFT: cufftHandle, cufftPlanMany, CUFFT_R2C, CUFFT_C2R,
     cufftDestroy, cufftExecR2C, cufftExecC2R, cufftSetStream
+using CUDA.CUBLAS: gemm_batched!
 
 using CUDA.Mem: pin
 
@@ -85,13 +86,23 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
     forward_padded_plan::SimpleBatchedCuFFTPlan
     rev_padded_plan::SimpleBatchedCuFFTPlan
 
-    convd_f_d::CuArray{Complex{Float32}, 3}
-    corr_f_d::CuArray{Complex{Float32}, 3}
-    template_f_d::CuArray{Complex{Float32}, 2}
-    template_f_d_scratch::CuArray{Complex{Float32}, 2}
+    convd_f_d::CuArray{ComplexF32, 3}
+    corr_f_d::CuArray{ComplexF32, 3}
+    corr_f_d_bak::CuArray{ComplexF32, 3}
+
+    subsample_search_radius::Float32
+    subsample_ratio::Int
+    subsample_intermediate::CuArray{ComplexF32, 3}
+    subsample_idft::CuArray{ComplexF32, 3}
+    subsample_complex_result::CuArray{ComplexF32, 3}
+    subsample_bdft::CuArray{ComplexF32, 3}
+    subsample_real_result::CuArray{Float32, 3}
+
+    template_f_d::CuArray{ComplexF32, 2}
+    template_f_d_scratch::CuArray{ComplexF32, 2}
     template_count::Int
 
-    padded_frames_f_d::CuArray{Complex{Float32}, 3}
+    padded_frames_f_d::CuArray{ComplexF32, 3}
 
     offsets_d::CuMatrix{Float32}
 
@@ -103,7 +114,8 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
                                  conv_kern::AbstractMatrix{Float32},
                                  img_kern::AbstractMatrix{Float32},
                                  scratch_dir::AbstractString = "";
-                                 npad = 20)
+                                 npad = 20, subsample_search_radius = 1.5,
+                                 subsample_ratio = 4)
         csz = size(conv_kern)
         csz[1] == csz[2] || throw(ArgumentError("square conv only"))
         ckern_l = csz[1]
@@ -148,35 +160,59 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
         rev_padded_plan = SimpleBatchedCuFFTPlan(rev_padded_plan_ref[])
 
         o_f_sz = (div(osz[1], 2) + 1, osz[2])
-        convd_f_d = CuArray{Complex{Float32}, 3}(undef, o_f_sz[1], o_f_sz[2],
+        convd_f_d = CuArray{ComplexF32, 3}(undef, o_f_sz[1], o_f_sz[2],
                                                  batch_l)
         corr_f_d = similar(convd_f_d)
+        corr_f_d_bak = similar(corr_f_d)
+
+        if subsample_ratio > 1
+            ninterp = n_interp_points(subsample_search_radius,
+                                      subsample_ratio)
+        else
+            ninterp = 0
+        end
+
+        subsample_intermediate = CuArray{ComplexF32, 3}(undef, o_f_sz[1],
+                                                        ninterp, batch_l)
+        subsample_idft = CuArray{ComplexF32, 3}(undef, o_f_sz[2], ninterp,
+                                                batch_l)
+        subsample_complex_result = CuArray{ComplexF32, 3}(undef, ninterp,
+                                                          ninterp, batch_l)
+        subsample_real_result = CuArray{Float32, 3}(undef, ninterp, ninterp,
+                                                    batch_l)
+        subsample_bdft = CuArray{ComplexF32, 3}(undef, ninterp, o_f_sz[1],
+                                                batch_l)
+
         offsets_d = CuMatrix{Float32}(undef, 2, batch_l)
-        template_f_d = CuMatrix{Complex{Float32}}(undef, o_f_sz)
+        template_f_d = CuMatrix{ComplexF32}(undef, o_f_sz)
         template_f_d_scratch = similar(template_f_d)
 
         pad_f_sz = (div(pad_sz[1], 2) + 1, pad_sz[2])
-        padded_frames_f_d = CuArray{Complex{Float32}, 3}(undef, pad_f_sz...,
+        padded_frames_f_d = CuArray{ComplexF32, 3}(undef, pad_f_sz...,
                                                          batch_l)
         synchronize()
 
         new{typeof(cdims)}(frames_h, offsets_h, 0, frames_d, padded_frames_d,
                            npad, convd_d, cdims, conv_kern_d, img_kern_d,
                            forward_plan, rev_plan, forward_padded_plan,
-                           rev_padded_plan, convd_f_d, corr_f_d, template_f_d,
+                           rev_padded_plan, convd_f_d, corr_f_d, corr_f_d_bak,
+                           subsample_search_radius, subsample_ratio,
+                           subsample_intermediate, subsample_idft,
+                           subsample_complex_result, subsample_bdft,
+                           subsample_real_result, template_f_d,
                            template_f_d_scratch, -1, padded_frames_f_d,
                            offsets_d)
     end
 end
 
 @inline device_to_fft_freq_unnorm(i, n, v = div(n, 2)) =
-    CUDA.mod(i - 1 + v, n) - v
+    CUDA.mod(i + v, n) - v
 
-function transfer_shift_ndxs!(offsets, max_ndxs, n, nx, ny)
+function transfer_shift_ndxs!(offsets, max_ndxs, n)
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     if i <= n
-        @inbounds offsets[1, i] = device_to_fft_freq_unnorm(max_ndxs[i][1], nx)
-        @inbounds offsets[2, i] = device_to_fft_freq_unnorm(max_ndxs[i][2], ny)
+        @inbounds offsets[1, i] = max_ndxs[i][1] - 1
+        @inbounds offsets[2, i] = max_ndxs[i][2] - 1
     end
     nothing
 end
@@ -193,6 +229,49 @@ function undo_shift_transformed!(transformed, offsets, nx, nxfull, ny, nz)
             device_to_fft_freq_unnorm(y, ny) / ny
         @inbounds transformed[i] = transformed[i] *
             CUDA.exp(-2 * pi * im * (x_exp + y_exp))
+    end
+    nothing
+end
+
+function fill_idft!(idftarr, offsets, nx, ny, nz, ntrans, nside, interp_ratio,
+                    n_half, upper_offset)
+    x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    y = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+    z = (blockIdx().z - 1) * blockDim().z + threadIdx().z
+    interp_offset = (y - 1 - nside) / interp_ratio
+    if x <= nx && y <= ny && z <= nz
+        interp_pos = interp_offset + offsets[2, z]
+        freq_pos = x - 1 + ifelse(x > n_half, upper_offset, 0)
+        idftarr[x, y, z] = conj_unity_root(freq_pos * interp_pos, ntrans)
+    end
+    nothing
+end
+
+function fill_bdft!(bdftarr, offsets, nx, ny, nz, ntrans, nside, interp_ratio,
+                    last_doubled_freq)
+    x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    y = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+    z = (blockIdx().z - 1) * blockDim().z + threadIdx().z
+    interp_offset = (x - 1 - nside) / interp_ratio
+    if x <= nx && y <= ny && z <= nz
+        coeff = CUDA.ifelse(1 < y <= last_doubled_freq, 2, 1)
+        interp_pos = interp_offset + offsets[1, z]
+        bdftarr[x, y, z] = coeff *
+            conj_unity_root((y - 1) * interp_pos, ntrans)
+    end
+    nothing
+end
+
+function determine_absolute_subsampled_max!(offsets, relmaxpos, n,
+                                            nside, interp_ratio, nx, ny)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if i <= n
+        unwrapped_x = offsets[1, i] +
+            (relmaxpos[i][1] - 1 - nside) / interp_ratio
+        offsets[1, i] = device_to_fft_freq_unnorm(unwrapped_x, nx)
+        unwrapped_y = offsets[2, i] +
+            (relmaxpos[i][2] - 1 - nside) / interp_ratio
+        offsets[2, i] = device_to_fft_freq_unnorm(unwrapped_y, ny)
     end
     nothing
 end
@@ -231,7 +310,22 @@ function process_batch!(s::AlignmentBatchState)
     nx, ny, batch_l = size(s.frames_h)
     nxc, nyc, _, _ = size(s.convd_d)
     frames_packed_d = dropdims(s.frames_d, dims = 3)
+    ninterp = size(s.subsample_real_result, 1)
+    o_f_sz = size(s.convd_f_d)[1:2]
     npad = s.npad
+    shift_block_size = (16, 16, 1)
+    nside = div(ninterp - 1, 2)
+    corr_mat_view = [view(s.corr_f_d_bak, :, :, i) for i in 1:batch_l]
+    subsample_idft_view = [view(s.subsample_idft, :, :, i) for i in 1:batch_l]
+    subsample_bdft_view = [view(s.subsample_bdft, :, :, i) for i in 1:batch_l]
+    subsample_intermediate_view = [view(s.subsample_intermediate, :, :, i) for
+                                   i in 1:batch_l]
+    subsample_complex_res_view = [view(s.subsample_complex_result, :, :, i) for
+                                  i in 1:batch_l]
+    nx_upsampled, ny_upsampled =
+        floor.(Int, (nxc, nyc) .* s.subsample_ratio)
+    n_half = div(nyc - 1, 2) + 1
+    upper_offset = ny_upsampled - nyc
     @sync begin
         @async CUDA.@sync begin
             # Convolve frames
@@ -244,22 +338,59 @@ function process_batch!(s::AlignmentBatchState)
             # Fourier transform frames
             convd_packed_d = dropdims(s.convd_d, dims = 3)
             update_stream(s.forward_plan)
-            cufftExecR2C(s.forward_plan, convd_packed_d, s.convd_f_d)
+            cufftExecR2C(s.forward_plan, s.convd_d, s.convd_f_d)
 
             # Correlate frames with template in frequency domain
             s.corr_f_d .= CUDA.conj.(s.template_f_d) .* s.convd_f_d
+            copyto!(s.corr_f_d_bak, s.corr_f_d)
             # Inverse Fourier transform of correlation
             update_stream(s.rev_plan)
-            cufftExecC2R(s.rev_plan, s.corr_f_d, convd_packed_d)
+            cufftExecC2R(s.rev_plan, s.corr_f_d, s.convd_d)
 
             # Find maximum correlation (locate best shift)
-            maxvals_d, maxpos_d =
+            _, maxpos_d =
                 findmax(convd_packed_d, dims = (1, 2))::Tuple{
                     CuArray{Float32, 3}, CuArray{CartesianIndex{3}, 3}
                 }
             nblocks_transfer = cld(batch_l, 256)
             @cuda(blocks=nblocks_transfer, threads=256,
-                  transfer_shift_ndxs!(s.offsets_d, maxpos_d, batch_l, nxc, nyc))
+                  transfer_shift_ndxs!(s.offsets_d, maxpos_d, batch_l))
+            @sync begin
+                @async CUDA.@sync begin
+                    idft_mat_grid_size = cld.(size(s.subsample_idft),
+                                              shift_block_size)
+                    @cuda(blocks=idft_mat_grid_size, threads = shift_block_size,
+                          fill_idft!(s.subsample_idft, s.offsets_d, o_f_sz[2],
+                                     ninterp, batch_l, o_f_sz[2], nside,
+                                     s.subsample_ratio, n_half, upper_offset))
+                    fill!(s.subsample_intermediate, 0)
+                    gemm_batched!('N', 'N', 1, corr_mat_view,
+                                  subsample_idft_view, 0,
+                                  subsample_intermediate_view)
+                end
+                @async CUDA.@sync begin
+                    last_doubled_freq = 1 + div(nx_upsampled - 1, 2)
+                    bdft_mat_grid_size = cld.(size(s.subsample_bdft),
+                                              shift_block_size)
+                    @cuda(blocks=bdft_mat_grid_size, threads = shift_block_size,
+                          fill_bdft!(s.subsample_bdft, s.offsets_d, ninterp,
+                                     o_f_sz[1], batch_l, nxc, nside,
+                                     s.subsample_ratio, last_doubled_freq))
+                end
+            end
+            fill!(s.subsample_complex_result, 0)
+            gemm_batched!('N', 'N', 1, subsample_bdft_view,
+                          subsample_intermediate_view, 0,
+                          subsample_complex_res_view)
+            s.subsample_real_result .= real.(s.subsample_complex_result)
+            _, maxpos_rel_d =
+                findmax(s.subsample_real_result, dims = (1, 2))::Tuple{
+                    CuArray{Float32, 3}, CuArray{CartesianIndex{3}, 3}
+                }
+            @cuda(blocks=nblocks_transfer, threads=256,
+                  determine_absolute_subsampled_max!(s.offsets_d, maxpos_rel_d,
+                                                     batch_l, nside,
+                                                     s.subsample_ratio, nxc, nyc))
         end
         @async CUDA.@sync begin
             # Pad frames
@@ -272,7 +403,6 @@ function process_batch!(s::AlignmentBatchState)
                          s.padded_frames_f_d)
         end
     end
-    shift_block_size = (16, 16, 1)
     @sync begin
         k = s.n_filled_frames
         @async CUDA.@sync begin
@@ -444,6 +574,16 @@ function align_video_data(outfile, vdata::AbstractArray{<:Any, 3}, conv_kern,
     s = AlignmentBatchState(nx, ny, batch_l, conv_kern, img_kern, scratch_dir;
                             kwargs...)
     align_video_data!(outfile, s, vdata; kwargs...)
+end
+
+conj_unity_root(k, n) = exp(im * 2 * pi * mod(k, n) / n)
+unity_root(k, n) = exp(-im * 2 * pi * mod(k, n) / n)
+
+n_interp_side_points(r, s) = max(floor(Int, r * s), 0)
+n_interp_points(r, s) = 2 * n_interp_side_points(r, s) + 1
+function interp_grid(c, r, s)
+    nside = n_interp_side_points(r, s)
+    c .+ (-nside:nside) ./ s
 end
 
 end
