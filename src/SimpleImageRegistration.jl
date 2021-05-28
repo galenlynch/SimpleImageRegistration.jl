@@ -69,6 +69,7 @@ end
 mutable struct AlignmentBatchState{T<:DenseConvDims}
     frames_h::Array{Float32, 3}
     offsets_h::Matrix{Float32}
+    offsets_interp_h::Matrix{Float32}
     n_filled_frames::Int
 
     frames_d::CuArray{Float32, 4}
@@ -90,6 +91,9 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
     corr_f_d::CuArray{ComplexF32, 3}
     corr_f_d_bak::CuArray{ComplexF32, 3}
 
+    subsample_use_for_template::Bool
+    subsample_use_for_alignment::Bool
+
     subsample_search_radius::Float32
     subsample_ratio::Int
     subsample_intermediate::CuArray{ComplexF32, 3}
@@ -105,6 +109,7 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
     padded_frames_f_d::CuArray{ComplexF32, 3}
 
     offsets_d::CuMatrix{Float32}
+    offsets_interp_d::CuMatrix{Float32}
 
     # This holds all of the arrays and plans on host and GPU to do alignment
     # If `scratch_dir` is empty, then the host buffers will be pinned to RAM.
@@ -115,7 +120,9 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
                                  img_kern::AbstractMatrix{Float32},
                                  scratch_dir::AbstractString = "";
                                  npad = 20, subsample_search_radius = 1.5,
-                                 subsample_ratio = 4)
+                                 subsample_ratio = 4,
+                                 subsample_use_for_template = false,
+                                 subsample_use_for_alignment = true)
         csz = size(conv_kern)
         csz[1] == csz[2] || throw(ArgumentError("square conv only"))
         ckern_l = csz[1]
@@ -124,6 +131,7 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
                                    scratch_dir)
         frames_h = isempty(scratch_dir) ? pin(b) : b
         offsets_h = pin(Matrix{Float32}(undef, 2, batch_l))
+        offsets_interp_h = pin(similar(offsets_h))
 
         frames_d = CuArray{Float32}(undef, nx, ny, 1, batch_l)
         pad_sz = (nx + 2 * npad, ny + 2 * npad, batch_l)
@@ -165,11 +173,13 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
         corr_f_d = similar(convd_f_d)
         corr_f_d_bak = similar(corr_f_d)
 
-        if subsample_ratio > 1
+        if subsample_ratio > 1 && (subsample_use_for_alignment || subsample_use_for_template)
             ninterp = n_interp_points(subsample_search_radius,
                                       subsample_ratio)
+            effective_subsample_ratio = subsample_ratio
         else
             ninterp = 0
+            effective_subsample_ratio = 1
         end
 
         subsample_intermediate = CuArray{ComplexF32, 3}(undef, o_f_sz[1],
@@ -184,6 +194,8 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
                                                 batch_l)
 
         offsets_d = CuMatrix{Float32}(undef, 2, batch_l)
+        interp_offset_l = ifelse(effective_subsample_ratio > 1, batch_l, 0)
+        offsets_interp_d = CuMatrix{Float32}(undef, 2, interp_offset_l)
         template_f_d = CuMatrix{ComplexF32}(undef, o_f_sz)
         template_f_d_scratch = similar(template_f_d)
 
@@ -192,16 +204,17 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
                                                          batch_l)
         synchronize()
 
-        new{typeof(cdims)}(frames_h, offsets_h, 0, frames_d, padded_frames_d,
-                           npad, convd_d, cdims, conv_kern_d, img_kern_d,
-                           forward_plan, rev_plan, forward_padded_plan,
-                           rev_padded_plan, convd_f_d, corr_f_d, corr_f_d_bak,
-                           subsample_search_radius, subsample_ratio,
-                           subsample_intermediate, subsample_idft,
-                           subsample_complex_result, subsample_bdft,
-                           subsample_real_result, template_f_d,
+        new{typeof(cdims)}(frames_h, offsets_h, offsets_interp_h, 0, frames_d,
+                           padded_frames_d, npad, convd_d, cdims, conv_kern_d,
+                           img_kern_d, forward_plan, rev_plan,
+                           forward_padded_plan, rev_padded_plan, convd_f_d,
+                           corr_f_d, corr_f_d_bak, subsample_use_for_template,
+                           subsample_use_for_alignment, subsample_search_radius,
+                           effective_subsample_ratio, subsample_intermediate,
+                           subsample_idft, subsample_complex_result,
+                           subsample_bdft, subsample_real_result, template_f_d,
                            template_f_d_scratch, -1, padded_frames_f_d,
-                           offsets_d)
+                           offsets_d, offsets_interp_d)
     end
 end
 
@@ -307,6 +320,9 @@ function batch_range(batch_no, batch_l, nf)
 end
 
 function process_batch!(s::AlignmentBatchState)
+    if s.subsample_use_for_template || s.subsample_use_for_alignment
+        error("Not yet implemented well")
+    end
     nx, ny, batch_l = size(s.frames_h)
     nxc, nyc, _, _ = size(s.convd_d)
     frames_packed_d = dropdims(s.frames_d, dims = 3)
@@ -355,42 +371,60 @@ function process_batch!(s::AlignmentBatchState)
             nblocks_transfer = cld(batch_l, 256)
             @cuda(blocks=nblocks_transfer, threads=256,
                   transfer_shift_ndxs!(s.offsets_d, maxpos_d, batch_l))
-            @sync begin
-                @async CUDA.@sync begin
-                    idft_mat_grid_size = cld.(size(s.subsample_idft),
-                                              shift_block_size)
-                    @cuda(blocks=idft_mat_grid_size, threads = shift_block_size,
-                          fill_idft!(s.subsample_idft, s.offsets_d, o_f_sz[2],
-                                     ninterp, batch_l, o_f_sz[2], nside,
-                                     s.subsample_ratio, n_half, upper_offset))
-                    fill!(s.subsample_intermediate, 0)
-                    gemm_batched!('N', 'N', 1, corr_mat_view,
-                                  subsample_idft_view, 0,
-                                  subsample_intermediate_view)
+            if s.subsample_ratio > 1
+                @sync begin
+                    @async CUDA.@sync begin
+                        idft_mat_grid_size = cld.(size(s.subsample_idft),
+                                                  shift_block_size)
+                        @cuda(blocks=idft_mat_grid_size,
+                              threads = shift_block_size,
+                              fill_idft!(s.subsample_idft, s.offsets_d,
+                                         o_f_sz[2], ninterp, batch_l, o_f_sz[2],
+                                         nside, s.subsample_ratio, n_half,
+                                         upper_offset))
+                        fill!(s.subsample_intermediate, 0)
+                        gemm_batched!('N', 'N', 1, corr_mat_view,
+                                      subsample_idft_view, 0,
+                                      subsample_intermediate_view)
+                    end
+                    @async CUDA.@sync begin
+                        last_doubled_freq = 1 + div(nx_upsampled - 1, 2)
+                        bdft_mat_grid_size = cld.(size(s.subsample_bdft),
+                                                  shift_block_size)
+                        @cuda(blocks=bdft_mat_grid_size,
+                              threads = shift_block_size,
+                              fill_bdft!(s.subsample_bdft, s.offsets_d, ninterp,
+                                         o_f_sz[1], batch_l, nxc, nside,
+                                         s.subsample_ratio, last_doubled_freq))
+                    end
                 end
-                @async CUDA.@sync begin
-                    last_doubled_freq = 1 + div(nx_upsampled - 1, 2)
-                    bdft_mat_grid_size = cld.(size(s.subsample_bdft),
-                                              shift_block_size)
-                    @cuda(blocks=bdft_mat_grid_size, threads = shift_block_size,
-                          fill_bdft!(s.subsample_bdft, s.offsets_d, ninterp,
-                                     o_f_sz[1], batch_l, nxc, nside,
-                                     s.subsample_ratio, last_doubled_freq))
+                @sync begin
+                    @async CUDA.@sync begin
+                        fill!(s.subsample_complex_result, 0)
+                        gemm_batched!('N', 'N', 1, subsample_bdft_view,
+                                      subsample_intermediate_view, 0,
+                                      subsample_complex_res_view)
+                        s.subsample_real_result .=
+                            real.(s.subsample_complex_result)
+                        _, maxpos_rel_d =
+                            findmax(s.subsample_real_result,
+                                    dims = (1, 2))::Tuple{
+                                        CuArray{Float32, 3},
+                                        CuArray{CartesianIndex{3}, 3}
+                                    }
+                        @cuda(blocks=nblocks_transfer, threads=256,
+                              determine_absolute_subsampled_max!(
+                                  s.offsets_interp_d, maxpos_rel_d, batch_l,
+                                  nside, s.subsample_ratio, nxc, nyc
+                              )
+                              )
+                    end
+                    @async CUDA.@sync s.offsets_d[1, :] .=
+                        device_to_fft_freq_unnorm.(s.offsets_d[1, :], nxc)
+                    @async CUDA.@sync s.offsets_d[2, :] .=
+                        device_to_fft_freq_unnorm.(s.offsets_d[2, :], nyc)
                 end
             end
-            fill!(s.subsample_complex_result, 0)
-            gemm_batched!('N', 'N', 1, subsample_bdft_view,
-                          subsample_intermediate_view, 0,
-                          subsample_complex_res_view)
-            s.subsample_real_result .= real.(s.subsample_complex_result)
-            _, maxpos_rel_d =
-                findmax(s.subsample_real_result, dims = (1, 2))::Tuple{
-                    CuArray{Float32, 3}, CuArray{CartesianIndex{3}, 3}
-                }
-            @cuda(blocks=nblocks_transfer, threads=256,
-                  determine_absolute_subsampled_max!(s.offsets_d, maxpos_rel_d,
-                                                     batch_l, nside,
-                                                     s.subsample_ratio, nxc, nyc))
         end
         @async CUDA.@sync begin
             # Pad frames
@@ -414,8 +448,8 @@ function process_batch!(s::AlignmentBatchState)
                     tmpl_shift_grid_size = cld.((nxcf, nyc, batch_l),
                                                 shift_block_size)
                     @cuda(blocks=tmpl_shift_grid_size, threads=shift_block_size,
-                          undo_shift_transformed!(s.convd_f_d, s.offsets_d, nxcf,
-                                             nxc, nyc, batch_l))
+                          undo_shift_transformed!(s.convd_f_d, s.offsets_d,
+                                                  nxcf, nxc, nyc, batch_l))
                     if k < batch_l
                         s.convd_f_d[:, :, k + 1 : batch_l] .= 0
                     end
@@ -448,8 +482,9 @@ function process_batch!(s::AlignmentBatchState)
         end
 
         @async copyto!(s.offsets_h, s.offsets_d)
+        @async copyto!(s.offsets_interp_h, s.offsets_interp_d)
     end
-    s.frames_h, s.offsets_h, s.n_filled_frames
+    s.frames_h, s.offsets_h, s.offset_interp_h, s.n_filled_frames
 end
 
 function collect_frames!(framesarr, frames::AbstractArray{<:Any, 3}, r)
@@ -507,15 +542,17 @@ function run_alignment!(sink_f::F, s::AlignmentBatchState,
         bout = make_buffer_maybe_mmap(Array{Float32, 3},
                                       (nx, ny, batch_l), scratch_dir)
         boffsets = Matrix{Float32}(undef, 2, batch_l)
+        boffsets_interp = similar(boffsets)
         r, kin = batch_range(2, batch_l, nf)
         t = @sync begin
             @async bin[:, :, 1:kin] .= frames[:, :, r]
             t = @async process_batch!(s)
             t
         end
-        aligned, offsets, k = fetch(t)
+        aligned, offsets, offsets_interp, k = fetch(t)
         # output buffers now contain results of first batch
         copyto!(boffsets, offsets)
+        copyto!(boffsets_interp, offsets_interp)
         copyto!(bout, aligned)
         for batch_no in 3:nbatch
             # Aligning batch_no - 1 batch, preparing data for batch_no batch,
@@ -523,26 +560,27 @@ function run_alignment!(sink_f::F, s::AlignmentBatchState,
             transfer_frames!(s, bin, 1:kin)
             r, kin = batch_range(batch_no, batch_l, nf)
             t = @sync begin
-                @async sink_f(bout, boffsets, k)
+                @async sink_f(bout, boffsets, boffsets_interp, k)
                 @async bin[:, :, 1:kin] .= frames[:, :, r]
                 t = @async process_batch!(s)
                 t
             end
 
-            _, _, k = fetch(t)
+            _, _, _, k = fetch(t)
             copyto!(boffsets, offsets)
+            copyto!(boffsets_interp, offsets_interp)
             copyto!(bout, aligned)
         end
         transfer_frames!(s, bin, 1:kin)
         # handling output of second to last batch, aligning last batch
         t = @sync begin
-            @async sink_f(bout, boffsets, k)
+            @async sink_f(bout, boffsets, boffsets_interp, k)
             t = @async process_batch!(s)
             t
         end
         # Handling output of last batch
-         _, _, k = fetch(t)
-        sink_f(aligned, offsets, k)
+         _, _, _, k = fetch(t)
+        sink_f(aligned, offsets, offsets_interp, k)
     else
         sink_f(process_batch!(s)...)
     end
