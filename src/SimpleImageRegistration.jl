@@ -66,6 +66,27 @@ function make_buffer_maybe_mmap(::Type{T}, sz, scratch_dir = "") where T
     b
 end
 
+struct GpuBatchConvState{T<:DenseConvDims}
+    cdims::T
+    conv_kern_d::CuArray{Float32, 4}
+
+    function GpuBatchConvState(conv_kern::AbstractMatrix{Float32},
+                               img_size::NTuple{2}, batch_l::Int,
+                               conv_padding::Integer = div(size(conv_kern, 1), 4))
+        csz = size(conv_kern)
+        csz[1] == csz[2] || throw(ArgumentError("square conv only"))
+        img_conv_size = (img_size..., 1, batch_l)
+        ckern_conv_size = (csz..., 1, 1)
+        cdims = DenseConvDims(img_conv_size, ckern_conv_size,
+                              padding = conv_padding)
+        conv_kern_d = CuArray(reshape(conv_kern, ckern_conv_size...))
+        new{typeof(cdims)}(cdims, conv_kern_d)
+    end
+end
+
+_do_conv!(dst, src, s::GpuBatchConvState) =
+    cudnnConvolutionForward(dst, src, s.conv_kern_d, s.cdims)
+
 mutable struct AlignmentBatchState{T<:DenseConvDims}
     frames_h::Array{Float32, 3}
     offsets_h::Matrix{Int32}
@@ -78,8 +99,7 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
 
     convd_d::CuArray{Float32, 4}
 
-    cdims::T
-    conv_kern_d::CuArray{Float32, 4}
+    gpu_conv_state::GpuBatchConvState{T}
     img_kern_d::CuArray{Float32, 2}
 
     forward_plan::SimpleBatchedCuFFTPlan
@@ -126,11 +146,11 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
                                  subsample_use_for_alignment = true,
                                  subsample_return_offsets =
                                      subsample_use_for_template ||
-                                     subsample_use_for_alignment)
-        csz = size(conv_kern)
-        csz[1] == csz[2] || throw(ArgumentError("square conv only"))
-        ckern_l = csz[1]
-        conv_kern_d = CuArray(reshape(conv_kern, size(conv_kern)..., 1, 1))
+                                     subsample_use_for_alignment,
+                                 conv_args = ())
+        conv_state = GpuBatchConvState(conv_kern, (nx, ny), batch_l,
+                                       conv_args...)
+
         b = make_buffer_maybe_mmap(Array{Float32, 3}, (nx, ny, batch_l),
                                    scratch_dir)
         frames_h = isempty(scratch_dir) ? pin(b) : b
@@ -139,23 +159,23 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
         frames_d = CuArray{Float32}(undef, nx, ny, 1, batch_l)
         pad_sz = (nx + 2 * npad, ny + 2 * npad, batch_l)
         padded_frames_d = CuArray{Float32, 3}(undef, pad_sz)
-        cdims = DenseConvDims(frames_d, conv_kern_d, padding = div(csz[1], 4))
-        osz = output_size(cdims)
+
+        osz = output_size(conv_state.cdims, conv_args...)
         i_win_sz = size(img_kern)
         i_win_sz == osz || throw(ArgumentError("window size wrong"))
-        convd_d = CuArray{Float32, 4}(undef, osz..., channels_out(cdims),
+        convd_d = CuArray{Float32, 4}(undef, osz..., channels_out(conv_state.cdims),
                                       batch_l)
         img_kern_d = CuArray(img_kern)
 
 
-        rosz = Cint[osz[2], osz[1]]
+        osz_r = Cint[osz[2], osz[1]]
         forward_plan_ref = Ref{cufftHandle}()
-        cufftPlanMany(forward_plan_ref, 2, rosz, C_NULL, 1, 1, C_NULL, 1, 1,
+        cufftPlanMany(forward_plan_ref, 2, osz_r, C_NULL, 1, 1, C_NULL, 1, 1,
                       CUFFT_R2C, batch_l)
         forward_plan = SimpleBatchedCuFFTPlan(forward_plan_ref[])
 
         rev_plan_ref = Ref{cufftHandle}()
-        cufftPlanMany(rev_plan_ref, 2, rosz, C_NULL, 1, 1, C_NULL, 1, 1,
+        cufftPlanMany(rev_plan_ref, 2, osz_r, C_NULL, 1, 1, C_NULL, 1, 1,
                       CUFFT_C2R, batch_l)
         rev_plan = SimpleBatchedCuFFTPlan(rev_plan_ref[])
 
@@ -211,18 +231,22 @@ mutable struct AlignmentBatchState{T<:DenseConvDims}
                                                          batch_l)
         synchronize()
 
-        new{typeof(cdims)}(frames_h, offsets_h, offsets_interp_h, 0, frames_d,
-                           padded_frames_d, npad, convd_d, cdims, conv_kern_d,
-                           img_kern_d, forward_plan, rev_plan,
-                           forward_padded_plan, rev_padded_plan, convd_f_d,
-                           corr_f_d, corr_f_d_bak, subsample_use_for_template,
-                           subsample_use_for_alignment, subsample_return_offsets,
-                           subsample_search_radius, effective_subsample_ratio,
-                           subsample_intermediate, subsample_idft,
-                           subsample_complex_result, subsample_bdft,
-                           subsample_real_result, template_f_d,
-                           template_f_d_scratch, -1, padded_frames_f_d,
-                           offsets_d, offsets_interp_d)
+        new{typeof(conv_state.cdims)}(frames_h, offsets_h, offsets_interp_h, 0,
+                                      frames_d, padded_frames_d, npad, convd_d,
+                                      conv_state, img_kern_d, forward_plan,
+                                      rev_plan, forward_padded_plan,
+                                      rev_padded_plan, convd_f_d, corr_f_d,
+                                      corr_f_d_bak, subsample_use_for_template,
+                                      subsample_use_for_alignment,
+                                      subsample_return_offsets,
+                                      subsample_search_radius,
+                                      effective_subsample_ratio,
+                                      subsample_intermediate, subsample_idft,
+                                      subsample_complex_result, subsample_bdft,
+                                      subsample_real_result, template_f_d,
+                                      template_f_d_scratch, -1,
+                                      padded_frames_f_d, offsets_d,
+                                      offsets_interp_d)
     end
 end
 
@@ -300,7 +324,7 @@ end
 
 function initialize_template!(s::AlignmentBatchState)
     # Convolve frames
-    cudnnConvolutionForward(s.convd_d, s.frames_d, s.conv_kern_d, s.cdims)
+    _do_conv!(s.convd_d, s.frames_d, s.conv_state)
 
     # Find mean windowed frame
     nxc, nyc, _, batch_l = size(s.convd_d)
@@ -417,8 +441,7 @@ function process_batch!(s::AlignmentBatchState)
     @sync begin
         @async CUDA.@sync begin
             # Convolve frames
-            cudnnConvolutionForward(s.convd_d, s.frames_d, s.conv_kern_d,
-                                    s.cdims)
+            _do_conv!(s.convd_d, s.frames_d, s.conv_state)
 
             # Apply window function to convolved result
             s.convd_d .*= s.img_kern_d
