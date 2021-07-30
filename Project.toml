@@ -1,7 +1,7 @@
 name = "SimpleImageRegistration"
 uuid = "429a002d-bc4d-4683-9383-b719270f290d"
 authors = ["Galen Lynch <galen@galenlynch.com>"]
-version = "0.1.0"
+version = "0.1.1"
 
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"

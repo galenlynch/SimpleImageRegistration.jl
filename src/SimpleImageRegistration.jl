@@ -1,7 +1,7 @@
 module SimpleImageRegistration
 
 using NNlib: DenseConvDims, output_size, channels_out
-using NNlibCUDA: cudnnConvolutionForward
+using NNlibCUDA: conv!
 using CUDA: CuArray, CuVector, CuMatrix, @cuda, blockIdx, blockDim, threadIdx,
     CuContext, CuStream, @context!, CuDefaultStream, stream, context,
     synchronize
@@ -85,7 +85,7 @@ struct GpuBatchConvState{T<:DenseConvDims}
 end
 
 _do_conv!(dst, src, s::GpuBatchConvState) =
-    cudnnConvolutionForward(dst, src, s.conv_kern_d, s.cdims)
+    conv!(dst, src, s.conv_kern_d, s.cdims)
 
 mutable struct AlignmentBatchState{T<:DenseConvDims}
     frames_h::Array{Float32, 3}
