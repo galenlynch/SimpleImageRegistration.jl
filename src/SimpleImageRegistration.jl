@@ -710,4 +710,52 @@ function interp_grid(c, r, s)
     c .+ (-nside:nside) ./ s
 end
 
+function _convolve_data!(convd_out, img_in, conv_state, batch_l)
+    nx, ny, nf = size(img_in)
+    nxc, nyc = output_size(conv_state.cdims)
+    ninbuff = 2
+    inbuffs_empty = Channel{CuArray{Float32, 4}}(ninbuff)
+    outbuffs_empty = Channel{CuArray{Float32, 4}}(ninbuff)
+    for i in 1:ninbuff
+        put!(inbuffs_empty, CuArray{Float32, 4}(undef, (nx, ny, 1, batch_l)))
+        put!(outbuffs_empty, CuArray{Float32, 4}(undef, (nxc, nyc, 1, batch_l)))
+    end
+
+    inbuffs_filled = Channel{Tuple{CuArray{Float32, 4}, UnitRange{Int}}}(1)
+    outbuffs_filled = Channel{Tuple{CuArray{Float32, 4}, UnitRange{Int}}}(1)
+    frames_h = pin(Array{Float32, 4}(undef, nx, ny, 1, batch_l))
+    frames_convd_h = pin(Array{Float32, 4}(undef, nxc, nyc, 1, batch_l))
+    @sync begin
+        feeder_t = @async begin
+            nbatch = cld(nf, batch_l)
+            for i in 1:nbatch
+                r, k = batch_range(i, batch_l, nf)
+                frames_h[:, :, 1, 1:k] .= img_in[:, :, r]
+                buff_d = take!(inbuffs_empty)
+                copyto!(buff_d, frames_h)
+                put!(inbuffs_filled, (buff_d, r))
+            end
+        end
+        conv_t = @async begin
+            for (buff_d, r) in inbuffs_filled
+                convd_d = take!(outbuffs_empty)
+                CUDA.@sync _do_conv!(convd_d, buff_d, conv_state)
+                put!(inbuffs_empty, buff_d)
+                put!(outbuffs_filled, (convd_d, r))
+            end
+        end
+        sink_t = @async begin
+            for (convd_d, r) in outbuffs_filled
+                copyto!(frames_convd_h, convd_d)
+                put!(outbuffs_empty, convd_d)
+                convd_out[:, :, r] .= frames_convd_h[:, :, 1, 1:length(r)]
+            end
+        end
+        bind(inbuffs_filled, feeder_t)
+        bind(outbuffs_filled, conv_t)
+    end
+    close(inbuffs_empty)
+    close(outbuffs_empty)
+end
+
 end
