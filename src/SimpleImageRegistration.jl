@@ -324,7 +324,7 @@ end
 
 function initialize_template!(s::AlignmentBatchState)
     # Convolve frames
-    _do_conv!(s.convd_d, s.frames_d, s.conv_state)
+    _do_conv!(s.convd_d, s.frames_d, s.gpu_conv_state)
 
     # Find mean windowed frame
     nxc, nyc, _, batch_l = size(s.convd_d)
@@ -441,7 +441,7 @@ function process_batch!(s::AlignmentBatchState)
     @sync begin
         @async CUDA.@sync begin
             # Convolve frames
-            _do_conv!(s.convd_d, s.frames_d, s.conv_state)
+            _do_conv!(s.convd_d, s.frames_d, s.gpu_conv_state)
 
             # Apply window function to convolved result
             s.convd_d .*= s.img_kern_d
