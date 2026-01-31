@@ -1,0 +1,3 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+SimpleImageRegistration = "429a002d-bc4d-4683-9383-b719270f290d"
